@@ -5558,6 +5558,13 @@ paths:
         schema:
           type: string
           default: system
+      requestBody:
+        description: Fetch option
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/model.ImageFetchOption'
+        required: true
       responses:
         "202":
           description: Accepted
@@ -5577,6 +5584,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/model.SimpleMsg'
+      x-codegen-request-body-name: fetchOption
   /ns/{nsId}/resources/fetchImagesResult:
     get:
       tags:
@@ -9143,6 +9151,25 @@ components:
           type: array
           items:
             type: string
+    model.ImageFetchOption:
+      type: object
+      properties:
+        excludedProviders:
+          type: array
+          description: "providers need to be excluded from the image fetching operation\
+            \ (ex: [\"azure\"])"
+          example:
+          - azure
+          items:
+            type: string
+        regionAgnosticProviders:
+          type: array
+          description: "providers that are not region-specific (ex: [\"gcp\"])"
+          example:
+          - gcp
+          - tencent
+          items:
+            type: string
     model.ImageStatus:
       type: string
       enum:
@@ -10103,7 +10130,7 @@ components:
       properties:
         count:
           type: integer
-        image:
+        imageList:
           type: array
           items:
             $ref: '#/components/schemas/model.TbImageInfo'
@@ -12844,8 +12871,6 @@ components:
           type: string
         elapsedTime:
           type: string
-        endTime:
-          type: string
         errorMsg:
           type: string
         imageCount:
@@ -12865,10 +12890,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/resource.ConnectionImageResult'
-        endTime:
+        elapsedTime:
           type: string
         failCount:
           type: integer
+        fetchOption:
+          $ref: '#/components/schemas/model.ImageFetchOption'
         namespaceId:
           type: string
         startTime:
@@ -12877,8 +12904,6 @@ components:
           type: integer
         totalImages:
           type: integer
-        totalTime:
-          type: string
     resource.JSONResult:
       type: object
     resource.RestFilterSpecsResponse:

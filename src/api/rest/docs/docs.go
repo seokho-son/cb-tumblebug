@@ -7270,6 +7270,15 @@ const docTemplate = `{
                         "name": "nsId",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "description": "Fetch option",
+                        "name": "fetchOption",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/model.ImageFetchOption"
+                        }
                     }
                 ],
                 "responses": {
@@ -12031,6 +12040,32 @@ const docTemplate = `{
                 }
             }
         },
+        "model.ImageFetchOption": {
+            "type": "object",
+            "properties": {
+                "excludedProviders": {
+                    "description": "providers need to be excluded from the image fetching operation (ex: [\"azure\"])",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "azure"
+                    ]
+                },
+                "regionAgnosticProviders": {
+                    "description": "providers that are not region-specific (ex: [\"gcp\"])",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "gcp",
+                        "tencent"
+                    ]
+                }
+            }
+        },
         "model.ImageStatus": {
             "type": "string",
             "enum": [
@@ -13425,7 +13460,7 @@ const docTemplate = `{
                 "count": {
                     "type": "integer"
                 },
-                "image": {
+                "imageList": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/model.TbImageInfo"
@@ -17132,9 +17167,6 @@ const docTemplate = `{
                 "elapsedTime": {
                     "type": "string"
                 },
-                "endTime": {
-                    "type": "string"
-                },
                 "errorMsg": {
                     "type": "string"
                 },
@@ -17164,11 +17196,14 @@ const docTemplate = `{
                         "$ref": "#/definitions/resource.ConnectionImageResult"
                     }
                 },
-                "endTime": {
+                "elapsedTime": {
                     "type": "string"
                 },
                 "failCount": {
                     "type": "integer"
+                },
+                "fetchOption": {
+                    "$ref": "#/definitions/model.ImageFetchOption"
                 },
                 "namespaceId": {
                     "type": "string"
@@ -17181,9 +17216,6 @@ const docTemplate = `{
                 },
                 "totalImages": {
                     "type": "integer"
-                },
-                "totalTime": {
-                    "type": "string"
                 }
             }
         },
