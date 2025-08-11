@@ -53,6 +53,12 @@ const (
 	// StatusTerminated is const for Terminated
 	StatusTerminated string = "Terminated"
 
+	// StatusPreparing is const for Preparing (resource preparation phase)
+	StatusPreparing string = "Preparing"
+
+	// StatusPrepared is const for Prepared (resources prepared, ready for creation)
+	StatusPrepared string = "Prepared"
+
 	// StatusCreating is const for Creating
 	StatusCreating string = "Creating"
 
@@ -676,6 +682,12 @@ type StatusCountInfo struct {
 
 	// CountCreating is for counting Creating
 	CountCreating int `json:"countCreating"`
+
+	// CountPreparing is for counting Preparing
+	CountPreparing int `json:"countPreparing"`
+
+	// CountPrepared is for counting Prepared
+	CountPrepared int `json:"countPrepared"`
 
 	// CountRunning is for counting Running
 	CountRunning int `json:"countRunning"`

@@ -15514,6 +15514,14 @@ const docTemplate = `{
                     "description": "CountFailed is for counting Failed",
                     "type": "integer"
                 },
+                "countPrepared": {
+                    "description": "CountPrepared is for counting Prepared",
+                    "type": "integer"
+                },
+                "countPreparing": {
+                    "description": "CountPreparing is for counting Preparing",
+                    "type": "integer"
+                },
                 "countRebooting": {
                     "description": "CountRebooting is for counting Rebooting",
                     "type": "integer"

@@ -516,6 +516,11 @@ func CheckAllowedTransition(nsId string, mciId string, vmId model.OptionalParame
 			return err
 		}
 
+		// Check if VM is in preparing or prepared state - these states don't support VM control actions
+		if strings.EqualFold(vm.Status, model.StatusPreparing) || strings.EqualFold(vm.Status, model.StatusPrepared) {
+			return fmt.Errorf("VM '%s' is in '%s' state and cannot perform action '%s'. VM must be running first", vmId.Value, vm.Status, action)
+		}
+
 		// duplicated action
 		if strings.EqualFold(vm.Status, targetStatus) {
 			if !strings.EqualFold(action, model.ActionReboot) {
@@ -548,6 +553,13 @@ func CheckAllowedTransition(nsId string, mciId string, vmId model.OptionalParame
 		if err != nil {
 			log.Error().Err(err).Msg("")
 			return err
+		}
+
+		// Check if MCI has VMs in preparing or prepared state
+		for _, vm := range mci.Vm {
+			if strings.EqualFold(vm.Status, model.StatusPreparing) || strings.EqualFold(vm.Status, model.StatusPrepared) {
+				return fmt.Errorf("MCI '%s' has VMs in preparation state ('%s'). Cannot perform '%s' action until all VMs are running", mciId, vm.Status, action)
+			}
 		}
 
 		// duplicated action

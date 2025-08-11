@@ -172,6 +172,61 @@ func RemoteCommandToMci(nsId string, mciId string, subGroupId string, vmId strin
 		vmList = filteredVmIds
 	}
 
+	// Check VM status and filter out VMs that are not ready for SSH commands
+	validVmList := make([]string, 0, len(vmList))
+	var vmStatusErrors []string
+
+	for _, vmId := range vmList {
+		vmStatus, err := GetMciVmStatus(nsId, mciId, vmId)
+		if err != nil {
+			vmStatusErrors = append(vmStatusErrors, fmt.Sprintf("VM '%s': failed to get status - %v", vmId, err))
+			continue
+		}
+
+		// Check if VM is in a state that supports SSH commands
+		if vmStatus.Status == model.StatusPreparing || vmStatus.Status == model.StatusPrepared {
+			vmStatusErrors = append(vmStatusErrors, fmt.Sprintf("VM '%s': in '%s' state, SSH commands not available until VM is running", vmId, vmStatus.Status))
+			continue
+		}
+
+		if vmStatus.Status == model.StatusCreating || vmStatus.Status == model.StatusTerminating ||
+			vmStatus.Status == model.StatusSuspending || vmStatus.Status == model.StatusResuming ||
+			vmStatus.Status == model.StatusRebooting {
+			vmStatusErrors = append(vmStatusErrors, fmt.Sprintf("VM '%s': in transitional state '%s', SSH commands not available", vmId, vmStatus.Status))
+			continue
+		}
+
+		if vmStatus.Status == model.StatusTerminated || vmStatus.Status == model.StatusFailed {
+			vmStatusErrors = append(vmStatusErrors, fmt.Sprintf("VM '%s': in '%s' state, SSH commands not available", vmId, vmStatus.Status))
+			continue
+		}
+
+		if vmStatus.Status == model.StatusSuspended {
+			vmStatusErrors = append(vmStatusErrors, fmt.Sprintf("VM '%s': suspended, SSH commands not available", vmId))
+			continue
+		}
+
+		// VM is in a valid state for SSH commands
+		validVmList = append(validVmList, vmId)
+	}
+
+	// Report VM status errors if any
+	if len(vmStatusErrors) > 0 {
+		log.Warn().Msgf("Some VMs are not ready for SSH commands: %v", vmStatusErrors)
+		if len(validVmList) == 0 {
+			return nil, fmt.Errorf("no VMs are available for SSH commands: %v", vmStatusErrors)
+		}
+	}
+
+	// Update vmList to only include valid VMs
+	vmList = validVmList
+
+	if len(vmList) == 0 {
+		return nil, fmt.Errorf("no VMs are available for SSH commands")
+	}
+
+	log.Info().Msgf("Executing SSH commands on %d VMs: %v", len(vmList), vmList)
+
 	// goroutine sync wg
 	var wg sync.WaitGroup
 

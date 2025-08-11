@@ -12304,6 +12304,12 @@ components:
         countFailed:
           type: integer
           description: CountFailed is for counting Failed
+        countPrepared:
+          type: integer
+          description: CountPrepared is for counting Prepared
+        countPreparing:
+          type: integer
+          description: CountPreparing is for counting Preparing
         countRebooting:
           type: integer
           description: CountRebooting is for counting Rebooting

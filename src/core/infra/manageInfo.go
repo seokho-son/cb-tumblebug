@@ -881,8 +881,8 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 		return mciStatus.Vm[i].Id < mciStatus.Vm[j].Id
 	})
 
-	statusFlag := []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-	statusFlagStr := []string{model.StatusFailed, model.StatusSuspended, model.StatusRunning, model.StatusTerminated, model.StatusCreating, model.StatusSuspending, model.StatusResuming, model.StatusRebooting, model.StatusTerminating, model.StatusUndefined}
+	statusFlag := []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	statusFlagStr := []string{model.StatusFailed, model.StatusSuspended, model.StatusRunning, model.StatusTerminated, model.StatusCreating, model.StatusPreparing, model.StatusPrepared, model.StatusSuspending, model.StatusResuming, model.StatusRebooting, model.StatusTerminating, model.StatusUndefined}
 	for _, v := range mciStatus.Vm {
 
 		switch v.Status {
@@ -896,16 +896,20 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 			statusFlag[3]++
 		case model.StatusCreating:
 			statusFlag[4]++
-		case model.StatusSuspending:
+		case model.StatusPreparing:
 			statusFlag[5]++
-		case model.StatusResuming:
+		case model.StatusPrepared:
 			statusFlag[6]++
-		case model.StatusRebooting:
+		case model.StatusSuspending:
 			statusFlag[7]++
-		case model.StatusTerminating:
+		case model.StatusResuming:
 			statusFlag[8]++
-		default:
+		case model.StatusRebooting:
 			statusFlag[9]++
+		case model.StatusTerminating:
+			statusFlag[10]++
+		default:
+			statusFlag[11]++
 		}
 	}
 
@@ -929,16 +933,7 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 	} else if tmpMax < numVm {
 		mciStatus.Status = "Partial-" + statusFlagStr[tmpMaxIndex] + proportionStr
 	} else {
-		mciStatus.Status = statusFlagStr[9] + proportionStr
-	}
-	// for representing Failed status in front.
-
-	proportionStr = ":" + strconv.Itoa(statusFlag[0]) + " (R:" + strconv.Itoa(runningStatus) + "/" + strconv.Itoa(numVm) + ")"
-	if statusFlag[0] > 0 {
-		mciStatus.Status = "Partial-" + statusFlagStr[0] + proportionStr
-		if statusFlag[0] == numVm {
-			mciStatus.Status = statusFlagStr[0] + proportionStr
-		}
+		mciStatus.Status = statusFlagStr[11] + proportionStr // Use index 11 for Undefined
 	}
 
 	// proportionStr = "-(" + strconv.Itoa(statusFlag[9]) + "/" + strconv.Itoa(numVm) + ")"
@@ -953,11 +948,13 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 	mciStatus.StatusCount.CountRunning = statusFlag[2]
 	mciStatus.StatusCount.CountTerminated = statusFlag[3]
 	mciStatus.StatusCount.CountCreating = statusFlag[4]
-	mciStatus.StatusCount.CountSuspending = statusFlag[5]
-	mciStatus.StatusCount.CountResuming = statusFlag[6]
-	mciStatus.StatusCount.CountRebooting = statusFlag[7]
-	mciStatus.StatusCount.CountTerminating = statusFlag[8]
-	mciStatus.StatusCount.CountUndefined = statusFlag[9]
+	mciStatus.StatusCount.CountPreparing = statusFlag[5]
+	mciStatus.StatusCount.CountPrepared = statusFlag[6]
+	mciStatus.StatusCount.CountSuspending = statusFlag[7]
+	mciStatus.StatusCount.CountResuming = statusFlag[8]
+	mciStatus.StatusCount.CountRebooting = statusFlag[9]
+	mciStatus.StatusCount.CountTerminating = statusFlag[10]
+	mciStatus.StatusCount.CountUndefined = statusFlag[11]
 
 	isDone := true
 	for _, v := range mciStatus.Vm {
@@ -1163,6 +1160,28 @@ func FetchVmStatus(nsId string, mciId string, vmId string) (model.TbVmStatusInfo
 
 	cspResourceName := temp.CspResourceName
 
+	// For VMs in preparing/prepared state, return the stored status without CSP query
+	if temp.Status == model.StatusPreparing || temp.Status == model.StatusPrepared {
+		vmStatus := model.TbVmStatusInfo{
+			Id:              temp.Id,
+			Name:            temp.Name,
+			CspResourceName: temp.CspResourceName,
+			Status:          temp.Status,
+			TargetStatus:    temp.TargetStatus,
+			TargetAction:    temp.TargetAction,
+			PublicIp:        temp.PublicIP,
+			PrivateIp:       temp.PrivateIP,
+			SSHPort:         temp.SSHPort,
+			Location:        temp.Location,
+			MonAgentStatus:  temp.MonAgentStatus,
+			NativeStatus:    model.StatusUndefined,
+			SystemMessage:   temp.SystemMessage,
+			CreatedTime:     temp.CreatedTime,
+		}
+		return vmStatus, nil
+	}
+
+	// Check cspResourceName for states other than preparing/prepared
 	if (temp.TargetAction != model.ActionCreate && temp.TargetAction != model.ActionTerminate) && cspResourceName == "" {
 		err = fmt.Errorf("cspResourceName is empty (VmId: %s)", vmId)
 		log.Error().Err(err).Msg("")
@@ -1439,6 +1458,126 @@ func UpdateVmInfo(nsId string, mciId string, vmInfoData model.TbVmInfo) {
 			log.Error().Err(err).Msg("")
 		}
 	}
+}
+
+// CreateMciInfo is func to create new MCI Info in kvstore
+func CreateMciInfo(nsId string, mciInfoData model.TbMciInfo) error {
+	mciInfoMutex.Lock()
+	defer mciInfoMutex.Unlock()
+
+	key := common.GenMciKey(nsId, mciInfoData.Id, "")
+
+	val, err := json.Marshal(mciInfoData)
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to marshal MCI info for %s", mciInfoData.Id)
+		return fmt.Errorf("failed to marshal MCI info for %s: %w", mciInfoData.Id, err)
+	}
+
+	err = kvstore.Put(key, string(val))
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to store MCI object %s", mciInfoData.Id)
+		return fmt.Errorf("failed to store MCI object %s: %w", mciInfoData.Id, err)
+	}
+
+	// Update label if specified
+	if mciInfoData.Label != nil && len(mciInfoData.Label) > 0 {
+		label.CreateOrUpdateLabel(model.StrMCI, mciInfoData.Id, key, mciInfoData.Label)
+	}
+
+	return nil
+}
+
+// CreateVmInfo is func to create new VM Info in kvstore
+func CreateVmInfo(nsId string, mciId string, vmInfoData model.TbVmInfo) error {
+	mciInfoMutex.Lock()
+	defer mciInfoMutex.Unlock()
+
+	key := common.GenMciKey(nsId, mciId, vmInfoData.Id)
+
+	val, err := json.Marshal(vmInfoData)
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to marshal VM info for %s", vmInfoData.Id)
+		return fmt.Errorf("failed to marshal VM info for %s: %w", vmInfoData.Id, err)
+	}
+
+	err = kvstore.Put(key, string(val))
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to store VM object %s", vmInfoData.Id)
+		return fmt.Errorf("failed to store VM object %s: %w", vmInfoData.Id, err)
+	}
+
+	// Update label if specified
+	if vmInfoData.Label != nil && len(vmInfoData.Label) > 0 {
+		label.CreateOrUpdateLabel(model.StrVM, vmInfoData.Id, key, vmInfoData.Label)
+	}
+
+	return nil
+}
+
+// UpdateVmStatus is func to update VM status efficiently
+func UpdateVmStatus(nsId string, mciId string, vmId string, status string, targetStatus string, systemMessage string) error {
+	vmInfo, err := GetVmObject(nsId, mciId, vmId)
+	if err != nil {
+		return fmt.Errorf("failed to get VM object %s: %w", vmId, err)
+	}
+
+	// Update status fields
+	vmInfo.Status = status
+	if targetStatus != "" {
+		vmInfo.TargetStatus = targetStatus
+	}
+	if systemMessage != "" {
+		vmInfo.SystemMessage = systemMessage
+	}
+
+	// Save updated VM object
+	key := common.GenMciKey(nsId, mciId, vmId)
+	val, err := json.Marshal(vmInfo)
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to marshal VM info for %s", vmId)
+		return fmt.Errorf("failed to marshal VM info for %s: %w", vmId, err)
+	}
+
+	err = kvstore.Put(key, string(val))
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to update VM status for %s", vmId)
+		return fmt.Errorf("failed to update VM status for %s: %w", vmId, err)
+	}
+
+	return nil
+}
+
+// UpdateMciStatus is func to update MCI status efficiently
+func UpdateMciStatus(nsId string, mciId string, status string, targetStatus string, systemMessage string) error {
+	mciInfo, err := GetMciObject(nsId, mciId)
+	if err != nil {
+		return fmt.Errorf("failed to get MCI object %s: %w", mciId, err)
+	}
+
+	// Update status fields
+	mciInfo.Status = status
+	if targetStatus != "" {
+		mciInfo.TargetStatus = targetStatus
+	}
+	if systemMessage != "" {
+		mciInfo.SystemMessage = systemMessage
+	}
+
+	// Save updated MCI object
+	key := common.GenMciKey(nsId, mciId, "")
+	val, err := json.Marshal(mciInfo)
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to marshal MCI info for %s", mciId)
+		return fmt.Errorf("failed to marshal MCI info for %s: %w", mciId, err)
+	}
+
+	err = kvstore.Put(key, string(val))
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to update MCI status for %s", mciId)
+		return fmt.Errorf("failed to update MCI status for %s: %w", mciId, err)
+	}
+
+	return nil
 }
 
 // GetMciAssociatedResources returns a list of associated resource IDs for given MCI info
