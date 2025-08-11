@@ -66,7 +66,7 @@ func createVmObjectSafe(nsId, mciId string, vmInfoData *model.TbVmInfo) error {
 	existingVm, err := GetVmObject(nsId, mciId, vmInfoData.Name)
 	if err == nil {
 		// VM object already exists, update it with new info instead of creating
-		log.Debug().Msgf("VM object '%s' already exists, updating instead of creating", vmInfoData.Name)
+		log.Debug().Msgf("VM_UPDATE: VM object '%s' already exists (status: %s), updating instead of creating", vmInfoData.Name, existingVm.Status)
 
 		// Update the existing VM with the new configuration
 		existingVm.Status = model.StatusCreating
@@ -91,6 +91,7 @@ func createVmObjectSafe(nsId, mciId string, vmInfoData *model.TbVmInfo) error {
 	}
 
 	// VM object doesn't exist, create it normally
+	log.Debug().Msgf("VM_OBJECT_NEW: Creating new VM object '%s' for the first time", vmInfoData.Name)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	return CreateVmObject(&wg, nsId, mciId, vmInfoData)
@@ -160,6 +161,60 @@ func createSubGroup(nsId, mciId string, vmRequest *model.TbVmReq, subGroupSize, 
 	}
 
 	return label.CreateOrUpdateLabel(model.StrSubGroup, uid, key, labels)
+}
+
+// logMciStatusCheckpoint logs detailed MCI status information for debugging VM duplication issues
+func logMciStatusCheckpoint(nsId, mciId, checkpoint, description string) {
+	log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - %s", checkpoint, description)
+
+	// Get current MCI object from kvstore
+	mciInfo, err := GetMciObject(nsId, mciId)
+	if err != nil {
+		log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - ERROR: Failed to get MCI object: %v", checkpoint, err)
+		return
+	}
+
+	// Log MCI summary information
+	log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - MCI '%s' Summary:", checkpoint, mciId)
+	log.Debug().Msgf("  🔹 MCI Status: %s → %s (Action: %s)", mciInfo.Status, mciInfo.TargetStatus, mciInfo.TargetAction)
+	log.Debug().Msgf("  🔹 Total VM Count: %d", len(mciInfo.Vm))
+	log.Debug().Msgf("  🔹 MCI UID: %s", mciInfo.Uid)
+
+	// Count VMs by status
+	statusCounts := make(map[string]int)
+	subGroupCounts := make(map[string]int)
+
+	// Log detailed VM information
+	log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - VM Details:", checkpoint)
+	for i, vm := range mciInfo.Vm {
+		log.Debug().Msgf("    [%d] VM '%s' (ID: '%s')", i, vm.Name, vm.Id)
+		log.Debug().Msgf("        - Status: %s → %s (Action: %s)", vm.Status, vm.TargetStatus, vm.TargetAction)
+		log.Debug().Msgf("        - SubGroupId: '%s'", vm.SubGroupId)
+		log.Debug().Msgf("        - ConnectionName: '%s'", vm.ConnectionName)
+		log.Debug().Msgf("        - UID: %s", vm.Uid)
+
+		// Count by status
+		statusCounts[vm.Status]++
+
+		// Count by subGroup
+		if vm.SubGroupId != "" {
+			subGroupCounts[vm.SubGroupId]++
+		}
+	}
+
+	// Log status summary
+	log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - VM Status Summary:", checkpoint)
+	for status, count := range statusCounts {
+		log.Debug().Msgf("  🔹 %s: %d VMs", status, count)
+	}
+
+	// Log subGroup summary
+	log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - SubGroup Summary:", checkpoint)
+	for subGroup, count := range subGroupCounts {
+		log.Debug().Msgf("  🔹 SubGroup '%s': %d VMs", subGroup, count)
+	}
+
+	log.Debug().Msgf("📊 MCI_STATUS_CHECKPOINT: %s - Checkpoint completed", checkpoint)
 }
 
 // createMciObject creates the MCI object with proper error handling
@@ -1100,6 +1155,7 @@ func CreateMci(nsId string, req *model.TbMciReq, option string) (*model.TbMciInf
 		wg.Add(1)
 		go func(cfg vmConfig) {
 			defer wg.Done()
+			log.Debug().Msgf("VM_OBJECT_CREATE: Attempting to create VM object '%s'", cfg.vmInfo.Name)
 			if err := createVmObjectSafe(nsId, mciId, &cfg.vmInfo); err != nil {
 				errorMu.Lock()
 				createErrors = append(createErrors, fmt.Errorf("VM object creation failed for '%s': %w", cfg.vmInfo.Name, err))
@@ -1424,59 +1480,23 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 
 	vmSubGroupRequests := req.Vm
 
-	// Create MCI object first with preparing status
-	mciInfo := model.TbMciInfo{
-		ResourceType:    model.StrMCI,
-		Id:              req.Name,
-		Uid:             common.GenUid(),
-		Name:            req.Name,
-		Status:          model.StatusPreparing,
-		TargetStatus:    model.StatusPrepared,
-		TargetAction:    "",
-		InstallMonAgent: req.InstallMonAgent,
-		Label:           req.Label,
-		SystemLabel:     req.SystemLabel,
-		Description:     req.Description,
-		PlacementAlgo:   "",
-		Vm:              []model.TbVmInfo{},
-		PostCommand:     req.PostCommand,
-		SystemMessage:   "",
+	// DEBUG: Log initial request details
+	log.Debug().Msgf("🔍 DEBUG: CreateMciDynamic started for MCI '%s'", req.Name)
+	log.Debug().Msgf("🔍 DEBUG: vmSubGroupRequests count: %d", len(vmSubGroupRequests))
+	for i, vmReq := range vmSubGroupRequests {
+		log.Debug().Msgf("🔍 DEBUG: [%d] vmReq Name: '%s', SubGroupSize: '%s'", i, vmReq.Name, vmReq.SubGroupSize)
 	}
 
-	// Save initial MCI object to kvstore (create new key)
-	key := common.GenMciKey(nsId, req.Name, "")
-	val, err := json.Marshal(mciInfo)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to marshal MCI info")
-		return emptyMci, fmt.Errorf("failed to marshal MCI info: %w", err)
+	// Pre-calculate expected VM count for validation
+	expectedVmCount := 0
+	for _, vmReq := range vmSubGroupRequests {
+		subGroupSize, err := strconv.Atoi(vmReq.SubGroupSize)
+		if err != nil {
+			subGroupSize = 1
+		}
+		expectedVmCount += subGroupSize
 	}
-
-	if err := kvstore.Put(key, string(val)); err != nil {
-		log.Error().Err(err).Msg("Failed to store MCI object")
-		return emptyMci, fmt.Errorf("failed to store MCI object: %w", err)
-	}
-
-	// Store label info
-	labels := map[string]string{
-		model.LabelManager:     model.StrManager,
-		model.LabelNamespace:   nsId,
-		model.LabelLabelType:   model.StrMCI,
-		model.LabelId:          req.Name,
-		model.LabelName:        req.Name,
-		model.LabelUid:         mciInfo.Uid,
-		model.LabelDescription: req.Description,
-	}
-	for k, v := range req.Label {
-		labels[k] = v
-	}
-
-	err = label.CreateOrUpdateLabel(model.StrMCI, mciInfo.Uid, key, labels)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to create label for MCI")
-		// Continue execution even if label creation fails
-	}
-
-	log.Info().Msgf("Created MCI object '%s' with preparing status", req.Name)
+	log.Debug().Msgf("🔍 DEBUG: Expected total VM count: %d", expectedVmCount)
 
 	// Pre-calculate all VM configurations that will be created for status tracking
 	type vmConfig struct {
@@ -1486,10 +1506,15 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 	}
 
 	var vmConfigs []vmConfig
+	var vmList []model.TbVmInfo // Collect VMs for final MCI creation
 	vmStartIndex := 1
 
 	// Track start index for each subGroup for consistent naming
 	subGroupStartIndex := make(map[string]int)
+
+	// DEBUG: Log VM processing start
+	log.Debug().Msgf("🔍 DEBUG: Starting VM processing phase...")
+	log.Debug().Msgf("🔍 DEBUG: Initial vmStartIndex: %d", vmStartIndex)
 
 	// Process VM requests and calculate configurations (without creating VM objects yet)
 	for _, vmSubGroupRequest := range vmSubGroupRequests {
@@ -1500,8 +1525,17 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 
 		log.Debug().Msgf("Processing VM request '%s' with subGroupSize: %d", vmSubGroupRequest.Name, subGroupSize)
 
+		// DEBUG: Log detailed subGroup processing
+		log.Debug().Msgf("🔍 DEBUG: Processing subGroup '%s':", vmSubGroupRequest.Name)
+		log.Debug().Msgf("  - SubGroupSize: %d", subGroupSize)
+		log.Debug().Msgf("  - Current vmStartIndex: %d", vmStartIndex)
+		log.Debug().Msgf("  - Will create VMs from index %d to %d", vmStartIndex, vmStartIndex+subGroupSize-1)
+
 		// Record start index for this subGroup for consistent naming
 		subGroupStartIndex[vmSubGroupRequest.Name] = vmStartIndex
+
+		// DEBUG: Log subGroup start index recording
+		log.Debug().Msgf("🔍 DEBUG: Recorded subGroupStartIndex['%s'] = %d", vmSubGroupRequest.Name, vmStartIndex)
 
 		// Get ConnectionName from CommonSpec (similar to getVmReqFromDynamicReq logic)
 		var connectionName string
@@ -1527,6 +1561,9 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 
 		// Build VM configurations (without creating VM objects - just for tracking)
 		for i := vmStartIndex; i < subGroupSize+vmStartIndex; i++ {
+			// DEBUG: Log each VM configuration creation
+			log.Debug().Msgf("🔍 DEBUG: Creating VM config %d for subGroup '%s' (loop index: %d)", i, vmSubGroupRequest.Name, i-vmStartIndex+1)
+
 			vmInfo := model.TbVmInfo{
 				ResourceType:     model.StrVM,
 				Uid:              common.GenUid(),
@@ -1540,50 +1577,134 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 				SystemMessage:    "",
 			}
 
-			// Set VM name based on subGroup logic
+			// Set VM name based on subGroup logic with proper per-subgroup indexing
 			if subGroupSize == 0 {
 				vmInfo.Name = common.ToLower(vmSubGroupRequest.Name)
 			} else {
 				vmInfo.SubGroupId = common.ToLower(vmSubGroupRequest.Name)
-				vmInfo.Name = common.ToLower(vmSubGroupRequest.Name) + "-" + strconv.Itoa(i)
+				// Use per-subgroup index starting from 1 for each subgroup
+				subGroupVmIndex := i - vmStartIndex + 1
+				vmInfo.Name = common.ToLower(vmSubGroupRequest.Name) + "-" + strconv.Itoa(subGroupVmIndex)
 			}
 			vmInfo.Id = vmInfo.Name
 
-			// Save VM object to kvstore for status tracking during resource preparation
-			if err := CreateVmInfo(nsId, req.Name, vmInfo); err != nil {
-				log.Error().Err(err).Msgf("Failed to create VM object %s", vmInfo.Name)
-				return emptyMci, err
-			}
+			// DEBUG: Log VM name generation with detailed index info
+			log.Debug().Msgf("🔍 DEBUG: Generated VM name: '%s' (ID: '%s', SubGroupId: '%s')", vmInfo.Name, vmInfo.Id, vmInfo.SubGroupId)
+			log.Debug().Msgf("🔍 DEBUG: Index calculation: globalIndex=%d, vmStartIndex=%d, subGroupVmIndex=%d", i, vmStartIndex, i-vmStartIndex+1)
 
-			// Add VM to configurations and MCI
+			// Add VM to configurations and VM list for later MCI creation
 			vmConfigs = append(vmConfigs, vmConfig{
 				vmInfo:       vmInfo,
 				subGroupSize: subGroupSize,
 				vmIndex:      i,
 			})
-			mciInfo.Vm = append(mciInfo.Vm, vmInfo)
 
-			log.Debug().Msgf("Created VM object '%s' with preparing status", vmInfo.Name)
+			// DEBUG: Log VM addition to collections
+			log.Debug().Msgf("🔍 DEBUG: Adding VM '%s' to vmList", vmInfo.Name)
+			vmList = append(vmList, vmInfo)
+
+			// DEBUG: Log counts
+			log.Debug().Msgf("🔍 DEBUG: vmConfigs count = %d, vmList count = %d", len(vmConfigs), len(vmList))
+
+			log.Debug().Msgf("Prepared VM config '%s' for MCI creation", vmInfo.Name)
 
 		}
 
 		// Update vmStartIndex for next subGroup
 		vmStartIndex += subGroupSize
+
+		// DEBUG: Log subGroup completion and vmStartIndex update
+		log.Debug().Msgf("🔍 DEBUG: Completed subGroup '%s'. Updated vmStartIndex to %d", vmSubGroupRequest.Name, vmStartIndex)
+		log.Debug().Msgf("🔍 DEBUG: Current totals - vmConfigs: %d, vmList: %d", len(vmConfigs), len(vmList))
 	}
 
-	// Update MCI with VM list (save again with VM list included)
+	// DEBUG: Log VM processing completion
+	log.Debug().Msgf("🔍 DEBUG: VM processing phase completed!")
+	log.Debug().Msgf("🔍 DEBUG: Final counts - vmConfigs: %d, vmList: %d", len(vmConfigs), len(vmList))
+
+	// Validate VM count against expected count
+	if len(vmList) != expectedVmCount {
+		err := fmt.Errorf("VM count mismatch: expected %d VMs (from subGroup sizes), but created %d VM configs", expectedVmCount, len(vmList))
+		log.Error().Err(err).Msg("VM count validation failed")
+		return emptyMci, err
+	}
+	log.Debug().Msgf("✅ VM count validation passed: %d VMs created as expected", len(vmList))
+
+	log.Debug().Msgf("🔍 DEBUG: Final vmList contents:")
+	for i, vm := range vmList {
+		log.Debug().Msgf("  [%d] VM '%s' (ID: '%s', SubGroupId: '%s')", i, vm.Name, vm.Id, vm.SubGroupId)
+	}
+
+	// Create complete MCI object with all VMs included (first time creation)
+	mciInfo := model.TbMciInfo{
+		ResourceType:    model.StrMCI,
+		Id:              req.Name,
+		Uid:             common.GenUid(),
+		Name:            req.Name,
+		Status:          model.StatusPreparing,
+		TargetStatus:    model.StatusPrepared,
+		TargetAction:    "",
+		InstallMonAgent: req.InstallMonAgent,
+		Label:           req.Label,
+		SystemLabel:     req.SystemLabel,
+		Description:     req.Description,
+		PlacementAlgo:   "",
+		Vm:              vmList, // Include all prepared VMs
+		PostCommand:     req.PostCommand,
+		SystemMessage:   "",
+	}
+
+	log.Debug().Msgf("🔍 DEBUG: Created complete MCI object with %d VMs", len(mciInfo.Vm))
+
+	// Save complete MCI object to kvstore (first time creation, not update)
+	key := common.GenMciKey(nsId, req.Name, "")
 	mciVal, err := json.Marshal(mciInfo)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to marshal updated MCI info with VM list")
-		return emptyMci, fmt.Errorf("failed to marshal updated MCI info: %w", err)
+		log.Error().Err(err).Msg("Failed to marshal complete MCI info")
+		return emptyMci, fmt.Errorf("failed to marshal complete MCI info: %w", err)
 	}
 
 	if err := kvstore.Put(key, string(mciVal)); err != nil {
-		log.Error().Err(err).Msg("Failed to update MCI object with VM list")
-		return emptyMci, fmt.Errorf("failed to update MCI object with VM list: %w", err)
+		log.Error().Err(err).Msg("Failed to create MCI object with VM list")
+		return emptyMci, fmt.Errorf("failed to create MCI object with VM list: %w", err)
 	}
 
-	log.Debug().Msgf("Updated MCI '%s' with %d VM objects", req.Name, len(mciInfo.Vm))
+	// Create individual VM objects in kvstore
+	for _, vmInfo := range vmList {
+		if err := CreateVmInfo(nsId, mciInfo.Id, vmInfo); err != nil {
+			log.Error().Err(err).Msgf("Failed to create VM object %s", vmInfo.Name)
+			return emptyMci, err
+		}
+		log.Debug().Msgf("🔍 DEBUG: VM object '%s' saved to kvstore via CreateVmInfo", vmInfo.Name)
+	}
+
+	// Store label info
+	labels := map[string]string{
+		model.LabelManager:     model.StrManager,
+		model.LabelNamespace:   nsId,
+		model.LabelLabelType:   model.StrMCI,
+		model.LabelId:          req.Name,
+		model.LabelName:        req.Name,
+		model.LabelUid:         mciInfo.Uid,
+		model.LabelDescription: req.Description,
+	}
+	for k, v := range req.Label {
+		labels[k] = v
+	}
+
+	err = label.CreateOrUpdateLabel(model.StrMCI, mciInfo.Uid, key, labels)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to create label for MCI")
+		// Continue execution even if label creation fails
+	}
+
+	log.Info().Msgf("Created complete MCI object '%s' with %d VM objects", req.Name, len(mciInfo.Vm))
+
+	// DEBUG: Log MCI creation to kvstore
+	log.Debug().Msgf("🔍 DEBUG: Complete MCI object created in kvstore with %d VMs", len(mciInfo.Vm))
+
+	// 📊 MCI STATUS CHECKPOINT: After complete MCI creation
+	logMciStatusCheckpoint(nsId, req.Name, "AFTER_COMPLETE_MCI_CREATION", "Complete MCI object created with all VMs in kvstore")
 
 	// Check whether VM names meet requirement and prepare resources
 	// Use semaphore for parallel processing with concurrency limit
@@ -1595,18 +1716,32 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 	errStr := ""
 	preparedVMs := make(map[string]bool)
 
+	// 📊 MCI STATUS CHECKPOINT: Before parallel resource preparation
+	logMciStatusCheckpoint(nsId, req.Name, "BEFORE_PARALLEL_PREPARATION", "Starting parallel resource preparation phase")
+
+	log.Debug().Msgf("🚀 GOROUTINE_SETUP: Starting parallel resource preparation for %d subGroups", len(vmSubGroupRequests))
+	log.Debug().Msgf("🚀 GOROUTINE_SETUP: Using maxConcurrency=%d, preparedVMs map initialized", maxConcurrency)
+
 	for i, k := range vmSubGroupRequests {
 		wg.Add(1)
+		log.Debug().Msgf("🚀 GOROUTINE_SETUP: Launching goroutine [%d] for subGroup '%s' (SubGroupSize: %s)", i, k.Name, k.SubGroupSize)
+
 		go func(index int, vmReq model.TbVmDynamicReq) {
 			defer wg.Done()
+			log.Debug().Msgf("🚀 GOROUTINE_START: [%d] Goroutine started for subGroup '%s'", index, vmReq.Name)
 
 			// Acquire semaphore
 			semaphore <- struct{}{}
-			defer func() { <-semaphore }() // Release semaphore
+			log.Debug().Msgf("🚀 GOROUTINE_START: [%d] Acquired semaphore for subGroup '%s'", index, vmReq.Name)
+			defer func() {
+				<-semaphore
+				log.Debug().Msgf("🚀 GOROUTINE_END: [%d] Released semaphore for subGroup '%s'", index, vmReq.Name)
+			}() // Release semaphore
 
 			// log VM request details
-			log.Debug().Msgf("[%d] VM Request: %+v", index, vmReq)
+			log.Debug().Msgf("🚀 GOROUTINE_START: [%d] VM Request: %+v", index, vmReq)
 
+			log.Debug().Msgf("🚀 GOROUTINE_START: [%d] Calling checkCommonResAvailableForVmDynamicReq for subGroup '%s'", index, vmReq.Name)
 			err := checkCommonResAvailableForVmDynamicReq(&vmReq, nsId)
 			if err != nil {
 				log.Error().Err(err).Msgf("[%d] Failed to find common resource for MCI provision", index)
@@ -1620,20 +1755,29 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 				}
 
 				startIdx := subGroupStartIndex[vmReq.Name]
+				log.Debug().Msgf("🚨 FAIL_PATH: [%d] Marking %d VMs as FAILED for subGroup '%s' (startIdx=%d)", index, subGroupSize, vmReq.Name, startIdx)
+
 				for i := startIdx; i < startIdx+subGroupSize; i++ {
 					var vmName string
 					if subGroupSize == 0 {
 						vmName = common.ToLower(vmReq.Name)
 					} else {
-						vmName = common.ToLower(vmReq.Name) + "-" + strconv.Itoa(i)
+						// Use per-subgroup index starting from 1 for each subgroup
+						subGroupVmIndex := i - startIdx + 1
+						vmName = common.ToLower(vmReq.Name) + "-" + strconv.Itoa(subGroupVmIndex)
 					}
 
+					log.Debug().Msgf("🚨 FAIL_PATH: [%d] Checking VM '%s' existence before marking as FAILED (globalIdx=%d, subGroupIdx=%d)", index, vmName, i, i-startIdx+1)
 					_, getErr := GetVmObject(nsId, req.Name, vmName)
 					if getErr == nil {
+						log.Debug().Msgf("🚨 FAIL_PATH: [%d] VM '%s' EXISTS - updating status to FAILED", index, vmName)
 						UpdateVmStatus(nsId, req.Name, vmName, model.StatusFailed, "", err.Error())
+					} else {
+						log.Debug().Msgf("🚨 FAIL_PATH: [%d] VM '%s' NOT FOUND - skipping FAILED status update: %v", index, vmName, getErr)
 					}
 				}
 				mutex.Unlock()
+				log.Debug().Msgf("🚨 FAIL_PATH: [%d] Completed FAILED status updates for subGroup '%s'", index, vmReq.Name)
 			} else {
 				// Mark all VMs in this subGroup as successfully prepared
 				mutex.Lock()
@@ -1643,53 +1787,71 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 				}
 
 				startIdx := subGroupStartIndex[vmReq.Name]
+				log.Debug().Msgf("✅ SUCCESS_PATH: [%d] Marking %d VMs as resource-available for subGroup '%s' (startIdx=%d)", index, subGroupSize, vmReq.Name, startIdx)
+				log.Debug().Msgf("✅ SUCCESS_PATH: [%d] VM name pattern will be: '%s-{1 to %d}' (using per-subgroup indexing)", index, common.ToLower(vmReq.Name), subGroupSize)
+
 				for i := startIdx; i < startIdx+subGroupSize; i++ {
 					var vmName string
 					if subGroupSize == 0 {
 						vmName = common.ToLower(vmReq.Name)
 					} else {
-						vmName = common.ToLower(vmReq.Name) + "-" + strconv.Itoa(i)
+						// Use per-subgroup index starting from 1 for each subgroup
+						subGroupVmIndex := i - startIdx + 1
+						vmName = common.ToLower(vmReq.Name) + "-" + strconv.Itoa(subGroupVmIndex)
 					}
 
+					log.Debug().Msgf("✅ SUCCESS_PATH: [%d] Processing VM globalIdx=%d -> subGroupIdx=%d -> VM name '%s'", index, i, i-startIdx+1, vmName)
+
+					// Mark VM as having available resources (not StatusPrepared yet)
 					preparedVMs[vmName] = true
-
-					// Update VM status to prepared
-					_, getErr := GetVmObject(nsId, req.Name, vmName)
-					if getErr == nil {
-						UpdateVmStatus(nsId, req.Name, vmName, model.StatusPrepared, model.StatusRunning, "Resources prepared successfully")
-					}
+					log.Debug().Msgf("✅ SUCCESS_PATH: [%d] Added VM '%s' to preparedVMs map (total resource-available: %d)", index, vmName, len(preparedVMs))
+					log.Debug().Msgf("✅ SUCCESS_PATH: [%d] VM '%s' resources are available but status remains unchanged until getVmReqFromDynamicReq", index, vmName)
 				}
+
+				log.Debug().Msgf("✅ SUCCESS_PATH: [%d] Completed resource availability check for subGroup '%s'", index, vmReq.Name)
+				log.Debug().Msgf("✅ SUCCESS_PATH: [%d] Final preparedVMs count: %d", index, len(preparedVMs))
 				mutex.Unlock()
-				log.Info().Msgf("[%d] VM subGroup '%s' resources prepared successfully (%d VMs)", index, vmReq.Name, subGroupSize)
+				log.Info().Msgf("[%d] VM subGroup '%s' resources are available (%d VMs)", index, vmReq.Name, subGroupSize)
 			}
 		}(i, k)
 	}
 
+	log.Debug().Msgf("🚀 GOROUTINE_SETUP: All %d goroutines launched, waiting for completion...", len(vmSubGroupRequests))
 	wg.Wait()
+	log.Debug().Msgf("🚀 GOROUTINE_COMPLETE: All goroutines completed! Final preparedVMs count: %d", len(preparedVMs))
+	log.Debug().Msgf("🚀 GOROUTINE_COMPLETE: preparedVMs map contents: %v", preparedVMs)
+
+	// 📊 MCI STATUS CHECKPOINT: After parallel resource preparation
+	logMciStatusCheckpoint(nsId, req.Name, "AFTER_PARALLEL_PREPARATION", "Parallel resource preparation phase completed")
 
 	// Update MCI status based on VM preparation results
+	log.Debug().Msgf("🔍 POST_GOROUTINE: Retrieving updated MCI object to check VM statuses...")
 	mciInfoUpdated, err := GetMciObject(nsId, req.Name)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to get MCI object for status update")
 		return emptyMci, err
 	}
 
-	// Count prepared vs failed VMs
+	// DEBUG: Log MCI object retrieval after status updates
+	log.Debug().Msgf("🔍 DEBUG: Retrieved updated MCI object with %d VMs", len(mciInfoUpdated.Vm))
+	log.Debug().Msgf("🔍 DEBUG: Updated MCI VM list:")
+	for i, vm := range mciInfoUpdated.Vm {
+		log.Debug().Msgf("  [%d] VM '%s' status: %s", i, vm.Name, vm.Status)
+	}
+
+	// Count resource-available vs failed VMs
 	preparedCount := len(preparedVMs)
 	totalVmCount := len(vmConfigs) // Total individual VMs, not vmRequests
 
 	if preparedCount == totalVmCount {
-		// All VMs prepared successfully
-		UpdateMciStatus(nsId, req.Name, model.StatusPrepared, model.StatusRunning, fmt.Sprintf("All %d VMs prepared successfully", totalVmCount))
-		log.Info().Msgf("MCI '%s': All %d VMs prepared successfully", req.Name, totalVmCount)
+		// All VMs have available resources
+		log.Info().Msgf("MCI '%s': All %d VMs have available resources", req.Name, totalVmCount)
 	} else if preparedCount > 0 {
-		// Partial preparation success
-		UpdateMciStatus(nsId, req.Name, model.StatusPreparing, "", fmt.Sprintf("Partial preparation: %d/%d VMs prepared", preparedCount, totalVmCount))
-		log.Warn().Msgf("MCI '%s': Partial preparation: %d/%d VMs prepared", req.Name, preparedCount, totalVmCount)
+		// Partial resource availability
+		log.Warn().Msgf("MCI '%s': Partial resource availability: %d/%d VMs have resources", req.Name, preparedCount, totalVmCount)
 	} else {
-		// All VMs failed preparation
-		UpdateMciStatus(nsId, req.Name, model.StatusFailed, "", "All VM resource preparations failed")
-		log.Error().Msgf("MCI '%s': All VM resource preparations failed", req.Name)
+		// All VMs failed resource availability check
+		log.Error().Msgf("MCI '%s': All VM resource availability checks failed", req.Name)
 	}
 
 	// Get updated MCI object for return
@@ -1698,6 +1860,9 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 		log.Error().Err(err).Msg("Failed to get updated MCI object")
 		return emptyMci, err
 	}
+
+	// DEBUG: Log final MCI object retrieval before vmRequest processing
+	log.Debug().Msgf("🔍 DEBUG: Final MCI object retrieved before vmRequest processing with %d VMs", len(mciInfoUpdated.Vm))
 
 	if errStr != "" {
 		err = fmt.Errorf("%s", errStr)
@@ -1709,6 +1874,13 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 	 * 1. Generate default resources first
 	 * 2. And then, parallel processing of VM requests
 	 */
+
+	// DEBUG: Log vmRequest processing start
+	log.Debug().Msgf("🔍 DEBUG: Starting vmRequest processing phase...")
+	log.Debug().Msgf("🔍 DEBUG: vmSubGroupRequests count: %d", len(vmSubGroupRequests))
+
+	// 📊 MCI STATUS CHECKPOINT: Before vmRequest processing
+	logMciStatusCheckpoint(nsId, req.Name, "BEFORE_VMREQUEST_PROCESSING", "Starting vmRequest processing phase")
 
 	// Check if vmRequest has elements
 	if len(vmSubGroupRequests) > 0 {
@@ -1722,25 +1894,123 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 		}
 		resultChan := make(chan vmResult, len(vmSubGroupRequests))
 
+		// DEBUG: Log parallel processing setup
+		log.Debug().Msgf("🔍 DEBUG: Setting up parallel processing for %d vmSubGroupRequests", len(vmSubGroupRequests))
+
 		// Process all vmRequests in parallel
-		for _, k := range vmSubGroupRequests {
+		for i, k := range vmSubGroupRequests {
 			wg.Add(1)
-			go func(vmReq model.TbVmDynamicReq) {
+			go func(index int, vmReq model.TbVmDynamicReq) {
 				defer wg.Done()
+
+				// DEBUG: Log goroutine start
+				log.Debug().Msgf("🔍 DEBUG: [Goroutine %d] Processing vmReq '%s'", index, vmReq.Name)
+
 				result, err := getVmReqFromDynamicReq(reqID, nsId, &vmReq)
+
+				// DEBUG: Log goroutine result
+				if err != nil {
+					log.Debug().Msgf("🔍 DEBUG: [Goroutine %d] vmReq '%s' failed: %v", index, vmReq.Name, err)
+				} else {
+					log.Debug().Msgf("🔍 DEBUG: [Goroutine %d] vmReq '%s' succeeded. Result VM name: '%s'", index, vmReq.Name, result.VmReq.Name)
+				}
+
 				resultChan <- vmResult{result: result, err: err}
-			}(k)
+			}(i, k)
 		}
 
 		// Wait for all goroutines to complete
 		wg.Wait()
 		close(resultChan)
 
+		// Update VM statuses based on getVmReqFromDynamicReq results
+		log.Debug().Msgf("🔍 DEBUG: Updating VM statuses based on getVmReqFromDynamicReq results...")
+
+		// Create maps to track successful and failed subgroups
+		successfulSubGroups := make(map[string]bool)
+		failedSubGroups := make(map[string]string) // subgroup name -> error message
+
+		// First pass: collect results to determine subgroup status
+		tempResults := make([]vmResult, 0, len(vmSubGroupRequests))
+		for vmRes := range resultChan {
+			tempResults = append(tempResults, vmRes)
+		}
+
+		// Analyze results per subgroup
+		for i, vmReq := range vmSubGroupRequests {
+			if i < len(tempResults) {
+				vmRes := tempResults[i]
+				if vmRes.err != nil {
+					failedSubGroups[vmReq.Name] = vmRes.err.Error()
+					log.Debug().Msgf("🔍 DEBUG: SubGroup '%s' failed: %v", vmReq.Name, vmRes.err)
+				} else {
+					successfulSubGroups[vmReq.Name] = true
+					log.Debug().Msgf("🔍 DEBUG: SubGroup '%s' succeeded", vmReq.Name)
+				}
+			}
+		}
+
+		// Update VM statuses for each subgroup
+		for _, vmSubGroupRequest := range vmSubGroupRequests {
+			subGroupSize, err := strconv.Atoi(vmSubGroupRequest.SubGroupSize)
+			if err != nil {
+				subGroupSize = 1
+			}
+
+			startIdx := subGroupStartIndex[vmSubGroupRequest.Name]
+			log.Debug().Msgf("🔍 DEBUG: Updating VM statuses for subGroup '%s' (size: %d, startIdx: %d)", vmSubGroupRequest.Name, subGroupSize, startIdx)
+
+			for i := startIdx; i < startIdx+subGroupSize; i++ {
+				var vmName string
+				if subGroupSize == 0 {
+					vmName = common.ToLower(vmSubGroupRequest.Name)
+				} else {
+					subGroupVmIndex := i - startIdx + 1
+					vmName = common.ToLower(vmSubGroupRequest.Name) + "-" + strconv.Itoa(subGroupVmIndex)
+				}
+
+				if successfulSubGroups[vmSubGroupRequest.Name] {
+					// Update VM status to StatusPrepared
+					err := UpdateVmStatus(nsId, req.Name, vmName, model.StatusPrepared, model.StatusRunning, "Resources prepared successfully via getVmReqFromDynamicReq")
+					if err != nil {
+						log.Warn().Msgf("🔍 DEBUG: Failed to update VM '%s' status to Prepared: %v", vmName, err)
+					} else {
+						log.Debug().Msgf("🔍 DEBUG: VM '%s' status updated to StatusPrepared", vmName)
+					}
+				} else if errorMsg, exists := failedSubGroups[vmSubGroupRequest.Name]; exists {
+					// Update VM status to StatusFailed
+					err := UpdateVmStatus(nsId, req.Name, vmName, model.StatusFailed, "", fmt.Sprintf("getVmReqFromDynamicReq failed: %s", errorMsg))
+					if err != nil {
+						log.Warn().Msgf("🔍 DEBUG: Failed to update VM '%s' status to Failed: %v", vmName, err)
+					} else {
+						log.Debug().Msgf("🔍 DEBUG: VM '%s' status updated to StatusFailed", vmName)
+					}
+				}
+			}
+		}
+
+		// 📊 MCI STATUS CHECKPOINT: After VM status updates from getVmReqFromDynamicReq
+		logMciStatusCheckpoint(nsId, req.Name, "AFTER_VMREQ_STATUS_UPDATE", "VM statuses updated based on getVmReqFromDynamicReq results")
+
+		// Now process the collected results for mciReq.Vm construction
+		// Reset the resultChan for result processing
+		resultChan = make(chan vmResult, len(tempResults))
+		for _, result := range tempResults {
+			resultChan <- result
+		}
+		close(resultChan)
+
+		// DEBUG: Log parallel processing completion
+		log.Debug().Msgf("🔍 DEBUG: All vmRequest goroutines completed. Starting result collection...")
+
 		// Collect results and check for errors
 		var hasError bool
 		var failedVMs []string
 		var errorDetails []string
 		var successfulVMs []string
+
+		// DEBUG: Log before mciReq.Vm collection
+		log.Debug().Msgf("🔍 DEBUG: Before result collection - mciReq.Vm count: %d", len(mciReq.Vm))
 
 		for vmRes := range resultChan {
 			if vmRes.err != nil {
@@ -1754,15 +2024,33 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 				}
 				failedVMs = append(failedVMs, vmName)
 				errorDetails = append(errorDetails, fmt.Sprintf("VM '%s': %s", vmName, vmRes.err.Error()))
+
+				// DEBUG: Log failed VM
+				log.Debug().Msgf("🔍 DEBUG: Failed VM added: '%s'", vmName)
 			} else {
 				// Safely append to the shared mciReq.Vm slice
 				mutex.Lock()
+
+				// DEBUG: Log before adding to mciReq.Vm
+				log.Debug().Msgf("🔍 DEBUG: Before adding VM '%s' to mciReq.Vm - current count: %d", vmRes.result.VmReq.Name, len(mciReq.Vm))
+
 				mciReq.Vm = append(mciReq.Vm, *vmRes.result.VmReq)
 				allCreatedResources = append(allCreatedResources, vmRes.result.CreatedResources...)
 				successfulVMs = append(successfulVMs, vmRes.result.VmReq.Name)
+
+				// DEBUG: Log after adding to mciReq.Vm
+				log.Debug().Msgf("🔍 DEBUG: After adding VM '%s' to mciReq.Vm - new count: %d", vmRes.result.VmReq.Name, len(mciReq.Vm))
+
 				mutex.Unlock()
 			}
 		}
+
+		// DEBUG: Log final result collection summary
+		log.Debug().Msgf("🔍 DEBUG: Result collection completed:")
+		log.Debug().Msgf("  - Final mciReq.Vm count: %d", len(mciReq.Vm))
+		log.Debug().Msgf("  - Successful VMs count: %d %v", len(successfulVMs), successfulVMs)
+		log.Debug().Msgf("  - Failed VMs count: %d %v", len(failedVMs), failedVMs)
+		log.Debug().Msgf("  - Created resources count: %d", len(allCreatedResources))
 
 		// If there were any errors, rollback all created resources
 		if hasError {
@@ -1820,12 +2108,68 @@ func CreateMciDynamic(reqID string, nsId string, req *model.TbMciDynamicReq, dep
 		Title: "Start instance provisioning", Time: time.Now(),
 	})
 
+	// 📊 MCI STATUS CHECKPOINT: After vmRequest processing completed
+	logMciStatusCheckpoint(nsId, req.Name, "AFTER_VMREQUEST_PROCESSING", "vmRequest processing phase completed")
+
+	// DEBUG: Log final mciReq state before CreateMci call
+	log.Debug().Msgf("🔍 DEBUG: Final mciReq state before CreateMci:")
+	log.Debug().Msgf("  - MCI name: '%s'", mciReq.Name)
+	log.Debug().Msgf("  - mciReq.Vm count: %d", len(mciReq.Vm))
+	for i, vmReq := range mciReq.Vm {
+		log.Debug().Msgf("    [%d] VM '%s' (SubGroupSize: %s)", i, vmReq.Name, vmReq.SubGroupSize)
+	}
+
+	// 📊 MCI STATUS CHECKPOINT: Before CreateMci call
+	logMciStatusCheckpoint(nsId, req.Name, "BEFORE_CREATEMCI", "About to call CreateMci function")
+
+	// DEBUG: Before calling CreateMci, let's check what VMs already exist in kvstore
+	log.Debug().Msgf("🔍 PRE_CREATEMCI: Checking existing VMs in kvstore before CreateMci call...")
+	existingMci, checkErr := GetMciObject(nsId, req.Name)
+	if checkErr == nil {
+		log.Debug().Msgf("🔍 PRE_CREATEMCI: Found existing MCI with %d VMs:", len(existingMci.Vm))
+		for i, vm := range existingMci.Vm {
+			log.Debug().Msgf("    [%d] Existing VM '%s' (ID: '%s', Status: '%s')", i, vm.Name, vm.Id, vm.Status)
+		}
+	} else {
+		log.Debug().Msgf("🔍 PRE_CREATEMCI: No existing MCI found or error: %v", checkErr)
+	}
+
 	// Run create MCI with the generated MCI request
 	option := "create"
 	if deployOption == "hold" {
 		option = "hold"
 	}
+
+	// DEBUG: Log CreateMci call
+	log.Debug().Msgf("🔍 DEBUG: Calling CreateMci with option '%s' and %d VM requests", option, len(mciReq.Vm))
+	log.Debug().Msgf("🔍 DEBUG: ⚠️  CRITICAL: CreateMci will process %d VM requests, but kvstore may already have individual VMs", len(mciReq.Vm))
+
 	result, err := CreateMci(nsId, &mciReq, option)
+
+	// 📊 MCI STATUS CHECKPOINT: After CreateMci call
+	logMciStatusCheckpoint(nsId, req.Name, "AFTER_CREATEMCI", "CreateMci function call completed")
+
+	// DEBUG: Log CreateMci result with detailed analysis
+	log.Debug().Msgf("🔍 POST_CREATEMCI: CreateMci call completed!")
+	if result != nil {
+		log.Debug().Msgf("🔍 POST_CREATEMCI: CreateMci returned MCI '%s' with %d VMs", result.Name, len(result.Vm))
+		log.Debug().Msgf("🔍 POST_CREATEMCI: ⚠️  ANALYSIS: Input had %d VM requests, output has %d VMs", len(mciReq.Vm), len(result.Vm))
+
+		if len(result.Vm) > len(mciReq.Vm) {
+			log.Debug().Msgf("🔍 POST_CREATEMCI: 🚨 VM COUNT INCREASED! This may indicate duplication")
+		}
+
+		log.Debug().Msgf("🔍 POST_CREATEMCI: Final VM list from CreateMci:")
+		for i, vm := range result.Vm {
+			log.Debug().Msgf("    [%d] VM '%s' (ID: '%s', Status: '%s', SubGroupId: '%s')", i, vm.Name, vm.Id, vm.Status, vm.SubGroupId)
+		}
+	} else {
+		log.Debug().Msgf("🔍 POST_CREATEMCI: CreateMci returned nil result")
+	}
+	if err != nil {
+		log.Debug().Msgf("🔍 POST_CREATEMCI: CreateMci returned error: %v", err)
+	}
+
 	return result, err
 }
 
@@ -2578,7 +2922,7 @@ func getVmReqFromDynamicReq(reqID string, nsId string, req *model.TbVmDynamicReq
 
 // CreateVmObject is func to add VM to MCI
 func CreateVmObject(wg *sync.WaitGroup, nsId string, mciId string, vmInfoData *model.TbVmInfo) error {
-	log.Debug().Msg("Start to add VM To MCI")
+	log.Debug().Msgf("🛠️ DEBUG: CreateVmObject - Start to add VM '%s' to MCI '%s'", vmInfoData.Id, mciId)
 	//goroutin
 	defer wg.Done()
 
@@ -2601,6 +2945,8 @@ func CreateVmObject(wg *sync.WaitGroup, nsId string, mciId string, vmInfoData *m
 
 	// Make VM object
 	key = common.GenMciKey(nsId, mciId, vmInfoData.Id)
+	log.Debug().Msgf("VM_CREATE: Creating VM object '%s' with status '%s'", vmInfoData.Id, vmInfoData.Status)
+
 	val, _ := json.Marshal(vmInfoData)
 	err = kvstore.Put(key, string(val))
 	if err != nil {

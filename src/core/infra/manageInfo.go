@@ -38,6 +38,34 @@ import (
 )
 
 var mciInfoMutex sync.Mutex
+var vmStatusMutexMap sync.Map  // map[string]*sync.Mutex for VM-specific locks
+var mciStatusMutexMap sync.Map // map[string]*sync.Mutex for MCI-specific locks
+
+// getVmStatusMutex returns a mutex for a specific VM
+func getVmStatusMutex(nsId, mciId, vmId string) *sync.Mutex {
+	key := fmt.Sprintf("%s/%s/%s", nsId, mciId, vmId)
+	if mutex, ok := vmStatusMutexMap.Load(key); ok {
+		return mutex.(*sync.Mutex)
+	}
+
+	// Create new mutex for this VM
+	mutex := &sync.Mutex{}
+	vmStatusMutexMap.Store(key, mutex)
+	return mutex
+}
+
+// getMciStatusMutex returns a mutex for a specific MCI
+func getMciStatusMutex(nsId, mciId string) *sync.Mutex {
+	key := fmt.Sprintf("%s/%s", nsId, mciId)
+	if mutex, ok := mciStatusMutexMap.Load(key); ok {
+		return mutex.(*sync.Mutex)
+	}
+
+	// Create new mutex for this MCI
+	mutex := &sync.Mutex{}
+	mciStatusMutexMap.Store(key, mutex)
+	return mutex
+}
 
 // [MCI and VM object information managemenet]
 
@@ -117,7 +145,11 @@ func ListVmId(nsId string, mciId string) ([]string, error) {
 			// prevent malformed key (if key for vm id includes '/', the key does not represent VM ID)
 			if !strings.Contains(trimmedString, "/") {
 				vmList = append(vmList, trimmedString)
+			} else {
+				log.Debug().Msgf("Skipped malformed key (contains '/'): %s", v.Key)
 			}
+		} else {
+			log.Debug().Msgf("Skipped non-VM key: %s", v.Key)
 		}
 	}
 
@@ -706,7 +738,7 @@ func ListVmInfo(nsId string, mciId string, vmId string) (*model.TbVmInfo, error)
 
 // GetMciObject is func to retrieve MCI object from database (no current status update)
 func GetMciObject(nsId string, mciId string) (model.TbMciInfo, error) {
-	//log.Debug().Msg("[GetMciObject]" + mciId)
+
 	key := common.GenMciKey(nsId, mciId, "")
 	keyValue, err := kvstore.GetKv(key)
 	if err != nil {
@@ -722,34 +754,41 @@ func GetMciObject(nsId string, mciId string) (model.TbMciInfo, error) {
 		return model.TbMciInfo{}, err
 	}
 
+	// Clear existing VM list to rebuild from kvstore
+	mciTmp.Vm = []model.TbVmInfo{}
+
 	for _, vmID := range vmList {
+
 		vmtmp, err := GetVmObject(nsId, mciId, vmID)
 		if err != nil {
-			log.Error().Err(err).Msg("")
+			log.Error().Err(err).Msgf("Failed to get VM object for '%s'", vmID)
 			return model.TbMciInfo{}, err
 		}
+
 		mciTmp.Vm = append(mciTmp.Vm, vmtmp)
 	}
 
+	log.Debug().Msgf("🔍 DEBUG: GetMciObject - Final result: %d VMs", len(mciTmp.Vm))
 	return mciTmp, nil
 }
 
 // GetVmObject is func to get VM object
 func GetVmObject(nsId string, mciId string, vmId string) (model.TbVmInfo, error) {
 	key := common.GenMciKey(nsId, mciId, vmId)
+
 	keyValue, err := kvstore.GetKv(key)
 	if keyValue == (kvstore.KeyValue{}) || err != nil {
 		err = fmt.Errorf("failed to get GetVmObject (ID: %s)", key)
-		log.Error().Err(err).Msg("")
 		return model.TbVmInfo{}, err
 	}
+
 	vmTmp := model.TbVmInfo{}
 	err = json.Unmarshal([]byte(keyValue.Value), &vmTmp)
 	if err != nil {
 		err = fmt.Errorf("failed to get GetVmObject (ID: %s), message: failed to unmarshal", key)
-		log.Error().Err(err).Msg("")
 		return model.TbVmInfo{}, err
 	}
+
 	return vmTmp, nil
 }
 
@@ -847,26 +886,34 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 	mciTmp := model.TbMciInfo{}
 	json.Unmarshal([]byte(keyValue.Value), &mciTmp)
 
-	vmList, err := ListVmId(nsId, mciId)
-	if err != nil {
-		log.Error().Err(err).Msg("")
-		return &model.MciStatusInfo{}, err
-	}
-	if len(vmList) == 0 {
+	// Use VM list from MCI object instead of kvstore keys to get accurate VM count
+	if len(mciTmp.Vm) == 0 {
+		log.Debug().Msgf("MCI '%s' has no VMs in its VM array", mciId)
 		return &model.MciStatusInfo{}, nil
 	}
 
+	// Build VM list from MCI object's VM array for accurate counting
+	vmList := make([]string, 0, len(mciTmp.Vm))
+	for _, vm := range mciTmp.Vm {
+		vmList = append(vmList, vm.Id)
+	}
+
+	log.Debug().Msgf("🔍 DEBUG: GetMciStatus - MCI '%s' has %d VMs in object: %v", mciId, len(vmList), vmList)
+
+	// Clear existing VM array in status object to rebuild it accurately
+	mciStatus.Vm = make([]model.TbVmStatusInfo, 0, len(vmList))
+
 	//goroutin sync wg
 	var wg sync.WaitGroup
-	for _, v := range vmList {
+	for _, vmId := range vmList {
 		wg.Add(1)
-		go FetchVmStatusAsync(&wg, nsId, mciId, v, &mciStatus)
+		go FetchVmStatusAsync(&wg, nsId, mciId, vmId, &mciStatus)
 	}
 	wg.Wait() //goroutine sync wg
 
-	for _, v := range vmList {
+	for _, vmId := range vmList {
 		// set master IP of MCI (Default rule: select 1st Running VM as master)
-		vmtmp, err := GetVmObject(nsId, mciId, v)
+		vmtmp, err := GetVmObject(nsId, mciId, vmId)
 		if err == nil {
 			if strings.EqualFold(vmtmp.Status, model.StatusRunning) {
 				mciStatus.MasterVmId = vmtmp.Id
@@ -883,7 +930,11 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 
 	statusFlag := []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	statusFlagStr := []string{model.StatusFailed, model.StatusSuspended, model.StatusRunning, model.StatusTerminated, model.StatusCreating, model.StatusPreparing, model.StatusPrepared, model.StatusSuspending, model.StatusResuming, model.StatusRebooting, model.StatusTerminating, model.StatusUndefined}
-	for _, v := range mciStatus.Vm {
+
+	log.Debug().Msgf("🔍 DEBUG: GetMciStatus - Starting status counting for %d VMs", len(mciStatus.Vm))
+
+	for i, v := range mciStatus.Vm {
+		log.Debug().Msgf("🔍 DEBUG: GetMciStatus - VM[%d] ID: '%s', Status: '%s'", i, v.Id, v.Status)
 
 		switch v.Status {
 		case model.StatusFailed:
@@ -912,6 +963,9 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 			statusFlag[11]++
 		}
 	}
+
+	log.Debug().Msgf("🔍 DEBUG: GetMciStatus - Status counts: Failed=%d, Suspended=%d, Running=%d, Terminated=%d, Creating=%d, Preparing=%d, Prepared=%d, Suspending=%d, Resuming=%d, Rebooting=%d, Terminating=%d, Undefined=%d",
+		statusFlag[0], statusFlag[1], statusFlag[2], statusFlag[3], statusFlag[4], statusFlag[5], statusFlag[6], statusFlag[7], statusFlag[8], statusFlag[9], statusFlag[10], statusFlag[11])
 
 	tmpMax := 0
 	tmpMaxIndex := 0
@@ -955,6 +1009,11 @@ func GetMciStatus(nsId string, mciId string) (*model.MciStatusInfo, error) {
 	mciStatus.StatusCount.CountRebooting = statusFlag[9]
 	mciStatus.StatusCount.CountTerminating = statusFlag[10]
 	mciStatus.StatusCount.CountUndefined = statusFlag[11]
+
+	log.Debug().Msgf("🔍 DEBUG: GetMciStatus - Final StatusCount: Total=%d, Failed=%d, Suspended=%d, Running=%d, Terminated=%d, Creating=%d, Preparing=%d, Prepared=%d, Suspending=%d, Resuming=%d, Rebooting=%d, Terminating=%d, Undefined=%d",
+		mciStatus.StatusCount.CountTotal, mciStatus.StatusCount.CountFailed, mciStatus.StatusCount.CountSuspended, mciStatus.StatusCount.CountRunning, mciStatus.StatusCount.CountTerminated,
+		mciStatus.StatusCount.CountCreating, mciStatus.StatusCount.CountPreparing, mciStatus.StatusCount.CountPrepared, mciStatus.StatusCount.CountSuspending, mciStatus.StatusCount.CountResuming,
+		mciStatus.StatusCount.CountRebooting, mciStatus.StatusCount.CountTerminating, mciStatus.StatusCount.CountUndefined)
 
 	isDone := true
 	for _, v := range mciStatus.Vm {
@@ -1408,8 +1467,10 @@ func GetMciVmStatus(nsId string, mciId string, vmId string) (*model.TbVmStatusIn
 
 // UpdateMciInfo is func to update MCI Info (without VM info in MCI)
 func UpdateMciInfo(nsId string, mciInfoData model.TbMciInfo) {
-	mciInfoMutex.Lock()
-	defer mciInfoMutex.Unlock()
+	// Use MCI-specific mutex instead of global mciInfoMutex for better concurrency
+	mciMutex := getMciStatusMutex(nsId, mciInfoData.Id)
+	mciMutex.Lock()
+	defer mciMutex.Unlock()
 
 	mciInfoData.Vm = nil
 
@@ -1435,10 +1496,10 @@ func UpdateMciInfo(nsId string, mciInfoData model.TbMciInfo) {
 
 // UpdateVmInfo is func to update VM Info
 func UpdateVmInfo(nsId string, mciId string, vmInfoData model.TbVmInfo) {
-	mciInfoMutex.Lock()
-	defer func() {
-		mciInfoMutex.Unlock()
-	}()
+	// Use VM-specific mutex instead of global mciInfoMutex to prevent race conditions
+	vmMutex := getVmStatusMutex(nsId, mciId, vmInfoData.Id)
+	vmMutex.Lock()
+	defer vmMutex.Unlock()
 
 	key := common.GenMciKey(nsId, mciId, vmInfoData.Id)
 
@@ -1516,12 +1577,25 @@ func CreateVmInfo(nsId string, mciId string, vmInfoData model.TbVmInfo) error {
 
 // UpdateVmStatus is func to update VM status efficiently
 func UpdateVmStatus(nsId string, mciId string, vmId string, status string, targetStatus string, systemMessage string) error {
+	// Get VM-specific mutex to prevent race conditions during read-modify-write operations
+	vmMutex := getVmStatusMutex(nsId, mciId, vmId)
+	vmMutex.Lock()
+	defer vmMutex.Unlock()
+
+	log.Debug().Msgf("🔄 DEBUG: UpdateVmStatus called for VM '%s' - status: '%s' -> '%s', target: '%s', message: '%s'",
+		vmId, "", status, targetStatus, systemMessage)
+
 	vmInfo, err := GetVmObject(nsId, mciId, vmId)
 	if err != nil {
+		log.Error().Msgf("🔄 DEBUG: UpdateVmStatus - Failed to get VM object '%s': %v", vmId, err)
 		return fmt.Errorf("failed to get VM object %s: %w", vmId, err)
 	}
 
+	log.Debug().Msgf("🔄 DEBUG: UpdateVmStatus - Retrieved VM '%s' current status: '%s' -> updating to: '%s'",
+		vmId, vmInfo.Status, status)
+
 	// Update status fields
+	oldStatus := vmInfo.Status
 	vmInfo.Status = status
 	if targetStatus != "" {
 		vmInfo.TargetStatus = targetStatus
@@ -1530,8 +1604,12 @@ func UpdateVmStatus(nsId string, mciId string, vmId string, status string, targe
 		vmInfo.SystemMessage = systemMessage
 	}
 
+	log.Debug().Msgf("🔄 DEBUG: UpdateVmStatus - VM '%s' status change: '%s' -> '%s'", vmId, oldStatus, vmInfo.Status)
+
 	// Save updated VM object
 	key := common.GenMciKey(nsId, mciId, vmId)
+	log.Debug().Msgf("🔄 DEBUG: UpdateVmStatus - Saving VM '%s' with key: '%s'", vmId, key)
+
 	val, err := json.Marshal(vmInfo)
 	if err != nil {
 		log.Error().Err(err).Msgf("Failed to marshal VM info for %s", vmId)
@@ -1544,11 +1622,17 @@ func UpdateVmStatus(nsId string, mciId string, vmId string, status string, targe
 		return fmt.Errorf("failed to update VM status for %s: %w", vmId, err)
 	}
 
+	log.Debug().Msgf("🔄 DEBUG: UpdateVmStatus - Successfully updated VM '%s' status to '%s'", vmId, status)
 	return nil
 }
 
 // UpdateMciStatus is func to update MCI status efficiently
 func UpdateMciStatus(nsId string, mciId string, status string, targetStatus string, systemMessage string) error {
+	// Use MCI-specific mutex to prevent race conditions during read-modify-write operations
+	mciMutex := getMciStatusMutex(nsId, mciId)
+	mciMutex.Lock()
+	defer mciMutex.Unlock()
+
 	mciInfo, err := GetMciObject(nsId, mciId)
 	if err != nil {
 		return fmt.Errorf("failed to get MCI object %s: %w", mciId, err)
